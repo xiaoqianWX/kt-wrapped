@@ -1,10 +1,16 @@
 import type { CodexUsageEvent } from "./collector";
-import { LONG_CONTEXT_INPUT_THRESHOLD, calculateCostUSD, getModelPricing } from "./pricing";
+import {
+  calculateCostUSD,
+  getLongContextBillingScope,
+  getLongContextInputThreshold,
+  getModelPricing,
+} from "./pricing";
 
 type SessionModelUsageTotals = {
   modelId: string;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteTokens: number;
   outputTokens: number;
   reasoningTokens: number;
   totalTokens: number;
@@ -12,18 +18,30 @@ type SessionModelUsageTotals = {
 };
 
 export async function calculateUsageCostFromEvents(events: CodexUsageEvent[]): Promise<number> {
-  // GPT-5.4 long-context pricing is session-scoped, so we can't price after collapsing everything to a model total.
+  // GPT-5.4 uses the long-context rate for its full session; newer models apply it per request.
   const sessionModelUsageTotals = new Map<string, SessionModelUsageTotals>();
+  const policyByModel = new Map<string, { scope: "session" | "request"; threshold: number }>();
 
   for (const event of events) {
-    const key = `${event.sessionKey}\u0000${event.model}`;
+    let policy = policyByModel.get(event.model);
+    if (!policy) {
+      policy = {
+        scope: getLongContextBillingScope(event.model),
+        threshold: getLongContextInputThreshold(event.model),
+      };
+      policyByModel.set(event.model, policy);
+    }
+    const hasLongContextPrompt = usesLongContextPricing(event, policy.threshold);
+    const sessionScoped = policy.scope === "session";
+    const key = `${event.sessionKey}\u0000${event.model}\u0000${sessionScoped ? "session" : hasLongContextPrompt}`;
     const usage = getOrCreateSessionModelUsage(sessionModelUsageTotals, key, event.model);
     usage.inputTokens += event.inputTokens;
     usage.cachedInputTokens += event.cachedInputTokens;
+    usage.cacheWriteTokens += event.cacheWriteTokens;
     usage.outputTokens += event.outputTokens;
     usage.reasoningTokens += event.reasoningOutputTokens;
     usage.totalTokens += getEventTotal(event);
-    if (usesLongContextPricing(event)) {
+    if (hasLongContextPrompt) {
       usage.hasLongContextPrompt = true;
     }
   }
@@ -34,6 +52,7 @@ export async function calculateUsageCostFromEvents(events: CodexUsageEvent[]): P
     if (
       usage.inputTokens === 0 &&
       usage.cachedInputTokens === 0 &&
+      usage.cacheWriteTokens === 0 &&
       usage.outputTokens === 0 &&
       usage.reasoningTokens === 0
     ) {
@@ -47,6 +66,7 @@ export async function calculateUsageCostFromEvents(events: CodexUsageEvent[]): P
       {
         inputTokens: usage.inputTokens,
         cachedInputTokens: usage.cachedInputTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
         outputTokens: usage.outputTokens,
       },
       pricing
@@ -72,6 +92,7 @@ function getOrCreateSessionModelUsage(
     modelId,
     inputTokens: 0,
     cachedInputTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens: 0,
     reasoningTokens: 0,
     totalTokens: 0,
@@ -86,9 +107,9 @@ function getEventTotal(event: CodexUsageEvent): number {
   return Math.max(event.totalTokens, computed);
 }
 
-function usesLongContextPricing(event: CodexUsageEvent): boolean {
+function usesLongContextPricing(event: CodexUsageEvent, threshold: number): boolean {
   // `inputTokens` is populated from Codex's per-request `last_token_usage` when available,
   // so we intentionally key the threshold off that request-sized signal instead of a
   // session-cumulative total.
-  return event.inputTokens > LONG_CONTEXT_INPUT_THRESHOLD;
+  return event.inputTokens > threshold;
 }

@@ -128,7 +128,14 @@ def collect_usage(
                         continue
 
                     prompt_tokens = _as_int(event.get("prompt_tokens"))
-                    cached_tokens = _as_int(event.get("cached_tokens"))
+                    # Anthropic backends report cache reads/writes under their native names.
+                    cached_tokens = _as_int(
+                        event.get("cached_tokens") or event.get("cache_read_input_tokens")
+                    )
+                    cache_write_tokens = _as_int(
+                        event.get("cache_write_tokens")
+                        or event.get("cache_creation_input_tokens")
+                    )
                     completion_tokens = _as_int(event.get("completion_tokens"))
                     reasoning_tokens = _as_int(
                         event.get("reasoning_tokens")
@@ -145,6 +152,7 @@ def collect_usage(
                             "model": context.model or UNKNOWN_MODEL,
                             "inputTokens": prompt_tokens,
                             "cachedInputTokens": cached_tokens,
+                            "cacheWriteTokens": cache_write_tokens,
                             "outputTokens": completion_tokens,
                             "reasoningOutputTokens": reasoning_tokens,
                             "totalTokens": total_tokens,
@@ -189,7 +197,11 @@ def _merge_model_context(current: ModelContext, event: dict[str, Any]) -> ModelC
 
 
 def _resolve_model_context(*, model: str = "", llm_name: str = "") -> ModelContext:
-    profile = get_profile(llm_name) if llm_name else None
+    try:
+        profile = get_profile(llm_name) if llm_name else None
+    except Exception:
+        # e.g. a bare preset name shared by several providers raises ValueError.
+        profile = None
     resolved_model = model or (profile.model if profile else "") or UNKNOWN_MODEL
     return ModelContext(model=resolved_model, llm_name=llm_name)
 

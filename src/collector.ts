@@ -1,9 +1,10 @@
 // Data collector - reads KohakuTerrarium session storage via a Python helper
 
-import { stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import os from "node:os";
+import collectorSource from "../scripts/collect_kt_usage.py" with { type: "text" };
 
 const KT_SESSIONS_PATH = join(os.homedir(), ".kohakuterrarium", "sessions");
 const COLLECTOR_SCRIPT = fileURLToPath(new URL("../scripts/collect_kt_usage.py", import.meta.url));
@@ -14,6 +15,7 @@ export interface CodexUsageEvent {
   model: string;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteTokens: number;
   outputTokens: number;
   reasoningOutputTokens: number;
   totalTokens: number;
@@ -61,6 +63,30 @@ export async function collectKtUsageData(year: number): Promise<CodexUsageData> 
 }
 
 async function runCollectorScript(year: number): Promise<CollectorPayload> {
+  // Source checkouts run the script on disk; compiled binaries only have the embedded copy.
+  if (await isFile(COLLECTOR_SCRIPT)) {
+    return runCollectorScriptAt(COLLECTOR_SCRIPT, year);
+  }
+
+  const tempDir = await mkdtemp(join(os.tmpdir(), "kt-wrapped-"));
+  try {
+    const scriptPath = join(tempDir, "collect_kt_usage.py");
+    await writeFile(scriptPath, collectorSource);
+    return await runCollectorScriptAt(scriptPath, year);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function runCollectorScriptAt(scriptPath: string, year: number): Promise<CollectorPayload> {
   const pythonCandidates = Array.from(
     new Set(
       [process.env.PYTHON, process.env.PYTHON3, "python3", "python"].filter(
@@ -73,7 +99,7 @@ async function runCollectorScript(year: number): Promise<CollectorPayload> {
 
   for (const python of pythonCandidates) {
     try {
-      const proc = Bun.spawn([python, COLLECTOR_SCRIPT, "--year", String(year)], {
+      const proc = Bun.spawn([python, scriptPath, "--year", String(year)], {
         stdout: "pipe",
         stderr: "pipe",
       });

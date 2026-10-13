@@ -9,6 +9,7 @@ function createEvent(overrides: Partial<CodexUsageEvent>): CodexUsageEvent {
     model: "gpt-5.4",
     inputTokens: 0,
     cachedInputTokens: 0,
+    cacheWriteTokens: 0,
     outputTokens: 0,
     reasoningOutputTokens: 0,
     totalTokens: 0,
@@ -82,5 +83,75 @@ describe("calculateUsageCostFromEvents", () => {
     ]);
 
     expect(cost).toBeCloseTo(2.65, 8);
+  });
+
+  test.each([
+    ["gpt-6-sol", 2.06],
+    ["gpt-6.1-sol", 2.04],
+  ])("uses request-scoped long-context pricing for %s", async (model, expectedCost) => {
+    const cost = await calculateUsageCostFromEvents([
+      createEvent({
+        model,
+        inputTokens: 300_000,
+        cachedInputTokens: 100_000,
+        cacheWriteTokens: 100_000,
+        outputTokens: 100_000,
+        totalTokens: 400_000,
+      }),
+      createEvent({
+        model,
+        inputTokens: 10_000,
+        outputTokens: 10_000,
+        totalTokens: 20_000,
+      }),
+    ]);
+
+    expect(cost).toBeCloseTo(expectedCost, 8);
+  });
+
+  test("uses GPT-6.1 Sol's long-context rates only above 272K input tokens", async () => {
+    const cost = await calculateUsageCostFromEvents([
+      createEvent({
+        model: "gpt-6.1-sol",
+        inputTokens: 272_000,
+        cachedInputTokens: 200_000,
+        cacheWriteTokens: 10_000,
+        outputTokens: 1_000,
+        totalTokens: 273_000,
+      }),
+      createEvent({
+        model: "gpt-6.1-sol",
+        inputTokens: 272_001,
+        cachedInputTokens: 200_000,
+        cacheWriteTokens: 10_000,
+        outputTokens: 1_000,
+        totalTokens: 273_001,
+      }),
+    ]);
+
+    expect(cost).toBeCloseTo(0.457004, 8);
+  });
+
+  test("uses Claude Haiku 5.5's higher rates only for prompts above 100K tokens", async () => {
+    const cost = await calculateUsageCostFromEvents([
+      createEvent({
+        model: "claude-haiku-5-5",
+        inputTokens: 100_000,
+        cachedInputTokens: 80_000,
+        cacheWriteTokens: 10_000,
+        outputTokens: 1_000,
+        totalTokens: 101_000,
+      }),
+      createEvent({
+        model: "claude-haiku-5-5",
+        inputTokens: 100_001,
+        cachedInputTokens: 80_000,
+        cacheWriteTokens: 10_000,
+        outputTokens: 1_000,
+        totalTokens: 101_001,
+      }),
+    ]);
+
+    expect(cost).toBeCloseTo(0.00355 + 0.0177505, 10);
   });
 });
