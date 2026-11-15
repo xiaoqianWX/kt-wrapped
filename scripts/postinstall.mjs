@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Postinstall script for codex-wrapped-noyrlimit
+ * Postinstall script for kt-wrapped
  *
  * This script runs after npm install and symlinks the correct platform-specific
  * binary to the bin directory. It auto-detects:
@@ -109,7 +109,7 @@ function getPackageName() {
   }
 
   // Build package name parts
-  const parts = ["codex-wrapped-noyrlimit", platform, arch];
+  const parts = ["kt-wrapped", platform, arch];
 
   // Add baseline suffix for x64 without AVX2
   if (arch === "x64" && !detectAVX2()) {
@@ -129,7 +129,7 @@ function getPackageName() {
  */
 function findBinary(packageName) {
   const binaryName =
-    os.platform() === "win32" ? "codex-wrapped-noyrlimit.exe" : "codex-wrapped-noyrlimit";
+    os.platform() === "win32" ? "kt-wrapped.exe" : "kt-wrapped";
 
   try {
     const packageJsonPath = require.resolve(`${packageName}/package.json`);
@@ -202,23 +202,23 @@ async function main() {
     const packageName = getPackageName();
 
     if (!packageName) {
-      console.error(`codex-wrapped-noyrlimit: Unsupported platform: ${os.platform()}-${os.arch()}`);
+      console.error(`kt-wrapped: Unsupported platform: ${os.platform()}-${os.arch()}`);
       console.error("Please download the binary manually from:");
-      console.error("https://github.com/numman-ali/codex-wrapped/releases");
+      console.error("https://github.com/xiaoqianWX/kt-wrapped");
       process.exit(0); // Exit gracefully
     }
 
-    console.log(`codex-wrapped-noyrlimit: Detected platform package: ${packageName}`);
+    console.log(`kt-wrapped: Detected platform package: ${packageName}`);
 
     const result = findBinary(packageName);
 
     if (!result) {
-      // Try fallback without baseline/musl
-      const baseParts = packageName.split("-").slice(0, 3);
-      const basePackage = baseParts.join("-");
+      // Try fallback without baseline/musl. The package name itself contains hyphens,
+      // so strip the known suffixes rather than splitting on "-".
+      const basePackage = packageName.replace(/(-baseline)?(-musl)?$/, "");
 
       if (basePackage !== packageName) {
-        console.log(`codex-wrapped-noyrlimit: Trying fallback package: ${basePackage}`);
+        console.log(`kt-wrapped: Trying fallback package: ${basePackage}`);
         const fallbackResult = findBinary(basePackage);
 
         if (fallbackResult) {
@@ -227,16 +227,16 @@ async function main() {
         }
       }
 
-      console.error(`codex-wrapped-noyrlimit: Could not find binary for ${packageName}`);
+      console.error(`kt-wrapped: Could not find binary for ${packageName}`);
       console.error("The optional dependency may have failed to install.");
       console.error("Please download the binary manually from:");
-      console.error("https://github.com/numman-ali/codex-wrapped/releases");
+      console.error("https://github.com/xiaoqianWX/kt-wrapped");
       process.exit(0);
     }
 
     linkBinary(result.binaryPath, result.binaryName);
   } catch (error) {
-    console.error("codex-wrapped-noyrlimit: Postinstall error:", error.message);
+    console.error("kt-wrapped: Postinstall error:", error.message);
     process.exit(0); // Exit gracefully to not break npm install
   }
 }
