@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -58,17 +59,28 @@ class ModelContext:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect KT wrapped usage data")
-    parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--session-dir", default=str(DEFAULT_SESSION_DIR))
     parser.add_argument("--timezone", default=None)
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Emit per-session data for every year (for kt-wrapped --web)",
+    )
     args = parser.parse_args()
+    if args.year is None and not args.dashboard:
+        parser.error("--year is required unless --dashboard is given")
 
     timezone_info = _resolve_timezone(args.timezone)
-    payload = collect_usage(
-        args.year,
-        session_dir=Path(args.session_dir).expanduser(),
-        timezone_info=timezone_info,
-    )
+    session_dir = Path(args.session_dir).expanduser()
+    if args.dashboard:
+        payload = collect_dashboard(session_dir=session_dir, timezone_info=timezone_info)
+    else:
+        payload = collect_usage(
+            args.year,
+            session_dir=session_dir,
+            timezone_info=timezone_info,
+        )
     json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
     return 0
@@ -127,37 +139,7 @@ def collect_usage(
                     if event_type != "token_usage":
                         continue
 
-                    prompt_tokens = _as_int(event.get("prompt_tokens"))
-                    # Anthropic backends report cache reads/writes under their native names.
-                    cached_tokens = _as_int(
-                        event.get("cached_tokens") or event.get("cache_read_input_tokens")
-                    )
-                    cache_write_tokens = _as_int(
-                        event.get("cache_write_tokens")
-                        or event.get("cache_creation_input_tokens")
-                    )
-                    completion_tokens = _as_int(event.get("completion_tokens"))
-                    reasoning_tokens = _as_int(
-                        event.get("reasoning_tokens")
-                        or event.get("reasoning_output_tokens")
-                    )
-                    total_tokens = _as_int(event.get("total_tokens"))
-                    if total_tokens <= 0:
-                        total_tokens = prompt_tokens + completion_tokens
-
-                    events.append(
-                        {
-                            "sessionKey": session_id,
-                            "timestamp": event_dt.isoformat(),
-                            "model": context.model or UNKNOWN_MODEL,
-                            "inputTokens": prompt_tokens,
-                            "cachedInputTokens": cached_tokens,
-                            "cacheWriteTokens": cache_write_tokens,
-                            "outputTokens": completion_tokens,
-                            "reasoningOutputTokens": reasoning_tokens,
-                            "totalTokens": total_tokens,
-                        }
-                    )
+                    events.append(_usage_event(session_id, event_dt, context, event))
                     session_active = True
 
             if session_active:
@@ -177,6 +159,144 @@ def collect_usage(
         "projects": sorted(projects),
         "earliestSessionDate": earliest_session_date,
     }
+
+
+def collect_dashboard(*, session_dir: Path, timezone_info: tzinfo) -> dict[str, Any]:
+    """Every year's usage, prompts and tool calls, keyed by session."""
+    files = sorted([*session_dir.glob("*.kohakutr"), *session_dir.glob("*.kt")])
+
+    sessions: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    prompts: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    seen_calls: set[str] = set()
+    # Copied or forked session files repeat events with the same timestamp and id.
+    seen_events: set[tuple[str, str, Any]] = set()
+
+    for path in files:
+        store = SessionStore(path)
+        try:
+            meta = store.load_meta()
+            session_id = str(meta.get("session_id") or path.stem)
+            start: datetime | None = None
+            end: datetime | None = None
+
+            for agent in [str(agent) for agent in meta.get("agents", []) if agent]:
+                context = _initial_model_context(store, agent)
+                for event in store.get_events(agent):
+                    event_type = str(event.get("type") or "")
+                    if event_type == "activity:session_info":
+                        context = _merge_model_context(context, event)
+                        continue
+
+                    event_dt = _coerce_datetime(event.get("ts"), timezone_info)
+                    if event_dt is None:
+                        continue
+                    start = event_dt if start is None or event_dt < start else start
+                    end = event_dt if end is None or event_dt > end else end
+
+                    if event_type in {"user_input", "token_usage"}:
+                        event_key = (event_type, repr(event.get("ts")), event.get("event_id"))
+                        if event_key in seen_events:
+                            continue
+                        seen_events.add(event_key)
+
+                    if event_type == "user_input":
+                        prompts.append(
+                            {
+                                "sessionKey": session_id,
+                                "timestamp": event_dt.isoformat(),
+                                "text": _prompt_text(event.get("content"))[:300],
+                            }
+                        )
+                    elif event_type == "token_usage":
+                        events.append(_usage_event(session_id, event_dt, context, event))
+                    elif event_type == "tool_call" and event.get("name"):
+                        call_id = str(
+                            event.get("call_id")
+                            or f"{session_id}:{agent}:{event.get('event_id') or event.get('ts')}"
+                        )
+                        if call_id in seen_calls:
+                            continue
+                        seen_calls.add(call_id)
+                        tool_calls.append(
+                            {
+                                "sessionKey": session_id,
+                                "timestamp": event_dt.isoformat(),
+                                # Older logs name calls like "read[2a1220]"; the suffix is a job id.
+                                "name": re.sub(r"\[[0-9a-f]{4,}\]$", "", str(event.get("name"))),
+                            }
+                        )
+
+            if start is not None and end is not None:
+                sessions.append(
+                    {
+                        "key": session_id,
+                        "project": str(meta.get("pwd") or ""),
+                        "start": start.isoformat(),
+                        "end": end.isoformat(),
+                        "title": meta.get("title") or meta.get("name") or None,
+                    }
+                )
+        finally:
+            store.close(update_status=False)
+
+    events.sort(key=lambda item: item["timestamp"])
+    return {
+        "sessions": sessions,
+        "events": events,
+        "prompts": prompts,
+        "toolCalls": tool_calls,
+    }
+
+
+def _usage_event(
+    session_id: str, event_dt: datetime, context: ModelContext, event: dict[str, Any]
+) -> dict[str, Any]:
+    prompt_tokens = _as_int(event.get("prompt_tokens"))
+    # Anthropic backends report cache reads/writes under their native names.
+    cached_tokens = _as_int(
+        event.get("cached_tokens") or event.get("cache_read_input_tokens")
+    )
+    cache_write_tokens = _as_int(
+        event.get("cache_write_tokens") or event.get("cache_creation_input_tokens")
+    )
+    completion_tokens = _as_int(event.get("completion_tokens"))
+    reasoning_tokens = _as_int(
+        event.get("reasoning_tokens") or event.get("reasoning_output_tokens")
+    )
+    total_tokens = _as_int(event.get("total_tokens"))
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+
+    return {
+        "sessionKey": session_id,
+        "timestamp": event_dt.isoformat(),
+        "model": context.model or UNKNOWN_MODEL,
+        "inputTokens": prompt_tokens,
+        "cachedInputTokens": cached_tokens,
+        "cacheWriteTokens": cache_write_tokens,
+        "outputTokens": completion_tokens,
+        "reasoningOutputTokens": reasoning_tokens,
+        "totalTokens": total_tokens,
+    }
+
+
+def _prompt_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        text = " ".join(t for t in texts if t).strip()
+        if text:
+            return text
+        if any(isinstance(part, dict) and part.get("type") != "text" for part in content):
+            return "[image]"
+    return ""
 
 
 def _initial_model_context(store: SessionStore, agent: str) -> ModelContext:

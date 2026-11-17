@@ -12,8 +12,12 @@ import { copyImageToClipboard } from "./clipboard";
 import { isWrappedAvailable } from "./utils/dates";
 import { formatCostFull, formatNumber, formatNumberFull } from "./utils/format";
 import type { CodexStats } from "./types";
+import { loadFonts } from "./image/fonts";
+import { buildDashboardPayload, DASHBOARD_PACKAGE } from "./web/adapter";
+import { openExternal, writeDashboard } from "./web/open";
+import { renderDashboardHtml } from "./web/render";
 
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 
 function printHelp() {
   console.log(`
@@ -26,12 +30,14 @@ USAGE:
 
 OPTIONS:
   --year <YYYY>    Generate wrapped for a specific year (default: current year)
+  --web, -w        Open an interactive dashboard in your browser instead of the card
   --help, -h       Show this help message
   --version, -v    Show version number
 
 EXAMPLES:
   kt-wrapped              # Generate current year wrapped
   kt-wrapped --year 2026  # Generate 2026 wrapped
+  kt-wrapped --web        # Explore your usage in the browser
 `);
 }
 
@@ -41,6 +47,7 @@ async function main() {
     args: process.argv.slice(2),
     options: {
       year: { type: "string", short: "y" },
+      web: { type: "boolean", short: "w" },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
     },
@@ -78,6 +85,11 @@ async function main() {
     p.cancel(
       "KT session data not found in ~/.kohakuterrarium/sessions\n\nMake sure you have used KohakuTerrarium at least once."
     );
+    process.exit(0);
+  }
+
+  if (values.web) {
+    await runDashboard(requestedYear);
     process.exit(0);
   }
 
@@ -173,7 +185,7 @@ async function main() {
 
   if (!p.isCancel(shouldShare) && shouldShare) {
     const tweetUrl = generateTweetUrl(stats);
-    const opened = await openUrl(tweetUrl);
+    const opened = await openExternal(tweetUrl);
     if (opened) {
       p.log.success("Opened X in your browser.");
     } else {
@@ -214,28 +226,30 @@ function generateTweetUrl(stats: CodexStats): string {
   return url.toString();
 }
 
-async function openUrl(url: string): Promise<boolean> {
-  const platform = process.platform;
-  let command: string;
-
-  if (platform === "darwin") {
-    command = "open";
-  } else if (platform === "win32") {
-    command = "start";
-  } else {
-    command = "xdg-open";
-  }
-
+async function runDashboard(year: number) {
+  const spinner = p.spinner();
+  spinner.start("Scanning your KT history...");
+  let html: string;
   try {
-    const proc = Bun.spawn([command, url], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    await proc.exited;
-    return proc.exitCode === 0;
-  } catch {
-    return false;
+    const payload = await buildDashboardPayload(year);
+    if (payload.usage.length === 0 && payload.prompts.length === 0) {
+      spinner.stop("No data found");
+      p.cancel("No KT activity found in your sessions.");
+      return;
+    }
+    const fonts = (await loadFonts()).map((font) => ({ weight: Number(font.weight), data: font.data as ArrayBuffer }));
+    html = renderDashboardHtml(payload, fonts);
+    spinner.stop(`Found ${formatNumber(payload.sessions.length)} sessions`);
+  } catch (error) {
+    spinner.stop("Failed to build the dashboard");
+    p.cancel(`Error: ${error}`);
+    process.exit(1);
   }
+
+  const path = await writeDashboard(DASHBOARD_PACKAGE, year, html);
+  p.log.success(`Dashboard saved to ${path}`);
+  const opened = await openExternal(path);
+  p.outro(opened ? "Opened in your browser." : "Open that file in your browser.");
 }
 
 main().catch((error) => {

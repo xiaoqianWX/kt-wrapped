@@ -32,8 +32,7 @@ export async function calculateUsageCostFromEvents(events: CodexUsageEvent[]): P
       policyByModel.set(event.model, policy);
     }
     const hasLongContextPrompt = usesLongContextPricing(event, policy.threshold);
-    const sessionScoped = policy.scope === "session";
-    const key = `${event.sessionKey}\u0000${event.model}\u0000${sessionScoped ? "session" : hasLongContextPrompt}`;
+    const key = billingGroupKey(event, policy.scope, hasLongContextPrompt);
     const usage = getOrCreateSessionModelUsage(sessionModelUsageTotals, key, event.model);
     usage.inputTokens += event.inputTokens;
     usage.cachedInputTokens += event.cachedInputTokens;
@@ -78,6 +77,63 @@ export async function calculateUsageCostFromEvents(events: CodexUsageEvent[]): P
   }
 
   return totalCost;
+}
+
+/**
+ * Per-event cost for the dashboard, priced exactly like the card: events are grouped the
+ * same way, so a session-scoped long-context rate applies to every event in that session.
+ * null = no price for the model.
+ */
+export async function calculateEventCostsUSD(events: CodexUsageEvent[]): Promise<Array<number | null>> {
+  const policyByModel = new Map<string, { scope: "session" | "request"; threshold: number }>();
+  const keys: string[] = [];
+  const longContextByKey = new Map<string, boolean>();
+
+  for (const event of events) {
+    let policy = policyByModel.get(event.model);
+    if (!policy) {
+      policy = {
+        scope: getLongContextBillingScope(event.model),
+        threshold: getLongContextInputThreshold(event.model),
+      };
+      policyByModel.set(event.model, policy);
+    }
+    const hasLongContextPrompt = usesLongContextPricing(event, policy.threshold);
+    const key = billingGroupKey(event, policy.scope, hasLongContextPrompt);
+    keys.push(key);
+    longContextByKey.set(key, (longContextByKey.get(key) ?? false) || hasLongContextPrompt);
+  }
+
+  const pricingCache = new Map<string, Awaited<ReturnType<typeof getModelPricing>>>();
+  const costs: Array<number | null> = [];
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
+    const longContext = longContextByKey.get(keys[i]) ?? false;
+    const cacheKey = `${event.model}\u0000${longContext}`;
+    if (!pricingCache.has(cacheKey)) {
+      pricingCache.set(cacheKey, await getModelPricing(event.model, { longContext }));
+    }
+    const pricing = pricingCache.get(cacheKey);
+    if (!pricing) {
+      costs.push(null);
+      continue;
+    }
+    const cost = calculateCostUSD(
+      {
+        inputTokens: event.inputTokens,
+        cachedInputTokens: event.cachedInputTokens,
+        cacheWriteTokens: event.cacheWriteTokens,
+        outputTokens: event.outputTokens,
+      },
+      pricing
+    );
+    costs.push(Number.isFinite(cost) ? cost : 0);
+  }
+  return costs;
+}
+
+function billingGroupKey(event: CodexUsageEvent, scope: "session" | "request", hasLongContextPrompt: boolean): string {
+  return `${event.sessionKey}\u0000${event.model}\u0000${scope === "session" ? "session" : hasLongContextPrompt}`;
 }
 
 function getOrCreateSessionModelUsage(

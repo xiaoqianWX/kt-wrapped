@@ -39,6 +39,22 @@ interface CollectorPayload {
   earliestSessionDate: string | null;
 }
 
+export interface KtDashboardSession {
+  key: string;
+  project: string;
+  start: string;
+  end: string;
+  title: string | null;
+}
+
+/** Every year's data, keyed by session (`collect_kt_usage.py --dashboard`). */
+export interface KtDashboardData {
+  sessions: KtDashboardSession[];
+  events: CodexUsageEvent[];
+  prompts: Array<{ sessionKey: string; timestamp: string; text: string }>;
+  toolCalls: Array<{ sessionKey: string; timestamp: string; name: string }>;
+}
+
 export async function checkKtDataExists(): Promise<boolean> {
   try {
     const info = await stat(KT_SESSIONS_PATH);
@@ -49,7 +65,7 @@ export async function checkKtDataExists(): Promise<boolean> {
 }
 
 export async function collectKtUsageData(year: number): Promise<CodexUsageData> {
-  const payload = await runCollectorScript(year);
+  const payload = await runCollectorScript<CollectorPayload>(["--year", String(year)]);
   return {
     events: payload.events,
     dailyActivity: new Map(Object.entries(payload.dailyActivity ?? {})),
@@ -62,17 +78,28 @@ export async function collectKtUsageData(year: number): Promise<CodexUsageData> 
   };
 }
 
-async function runCollectorScript(year: number): Promise<CollectorPayload> {
+export async function collectKtDashboardData(sessionDir?: string): Promise<KtDashboardData> {
+  const args = ["--dashboard", ...(sessionDir ? ["--session-dir", sessionDir] : [])];
+  const payload = await runCollectorScript<Partial<KtDashboardData>>(args);
+  return {
+    sessions: payload.sessions ?? [],
+    events: payload.events ?? [],
+    prompts: payload.prompts ?? [],
+    toolCalls: payload.toolCalls ?? [],
+  };
+}
+
+async function runCollectorScript<T>(args: string[]): Promise<T> {
   // Source checkouts run the script on disk; compiled binaries only have the embedded copy.
   if (await isFile(COLLECTOR_SCRIPT)) {
-    return runCollectorScriptAt(COLLECTOR_SCRIPT, year);
+    return runCollectorScriptAt<T>(COLLECTOR_SCRIPT, args);
   }
 
   const tempDir = await mkdtemp(join(os.tmpdir(), "kt-wrapped-"));
   try {
     const scriptPath = join(tempDir, "collect_kt_usage.py");
     await writeFile(scriptPath, collectorSource);
-    return await runCollectorScriptAt(scriptPath, year);
+    return await runCollectorScriptAt<T>(scriptPath, args);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -86,7 +113,7 @@ async function isFile(path: string): Promise<boolean> {
   }
 }
 
-async function runCollectorScriptAt(scriptPath: string, year: number): Promise<CollectorPayload> {
+async function runCollectorScriptAt<T>(scriptPath: string, args: string[]): Promise<T> {
   const pythonCandidates = Array.from(
     new Set(
       [process.env.PYTHON, process.env.PYTHON3, "python3", "python"].filter(
@@ -99,7 +126,7 @@ async function runCollectorScriptAt(scriptPath: string, year: number): Promise<C
 
   for (const python of pythonCandidates) {
     try {
-      const proc = Bun.spawn([python, scriptPath, "--year", String(year)], {
+      const proc = Bun.spawn([python, scriptPath, ...args], {
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -115,7 +142,7 @@ async function runCollectorScriptAt(scriptPath: string, year: number): Promise<C
         continue;
       }
 
-      return JSON.parse(stdout) as CollectorPayload;
+      return JSON.parse(stdout) as T;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }

@@ -48,7 +48,7 @@ const DEFAULT_LOGO_CANDIDATES = [
   ),
 ].filter((value): value is string => Boolean(value));
 
-async function loadLogoDataUrl(): Promise<string> {
+export async function loadLogoDataUrl(): Promise<string> {
   for (const candidate of DEFAULT_LOGO_CANDIDATES) {
     try {
       const bytes = await readFile(candidate);
